@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { upsertEventCanonical } from "../_shared/event-write.ts";
 import { upsertVenue } from "../_shared/venue-upsert.ts";
 import {
   resolveEventLocation,
@@ -45,11 +46,15 @@ interface RawEvent {
   cover_url:  string | null;
   price_min:  number | null;
   start_time: string | null;
+  lineup: string[];
+  description?: string | null;
 }
 
 interface EventDetail {
   start_time: string | null;
   price_min:  number | null;
+  description: string | null;
+  lineup: string[];
 }
 
 interface FetchPageResult {
@@ -236,6 +241,8 @@ function parseEvents(html: string): RawEvent[] {
       date:        parsedDate.startsAt,
       start_time:  null,
       price_min:   null,
+      lineup:      [],
+      description: null,
     });
   }
   return events;
@@ -259,10 +266,10 @@ async function fetchEventDetail(ticketUrl: string): Promise<EventDetail> {
     const res = await fetch(ticketUrl, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; grub-scraper/1.0; +https://grub.app)" },
     });
-    if (!res.ok) return { start_time: null, price_min: null };
+    if (!res.ok) return { start_time: null, price_min: null, description: null, lineup: [] };
     html = await res.text();
   } catch {
-    return { start_time: null, price_min: null };
+    return { start_time: null, price_min: null, description: null, lineup: [] };
   }
 
   // ── start_time ────────────────────────────────────────────────────────────
@@ -290,7 +297,25 @@ async function fetchEventDetail(ticketUrl: string): Promise<EventDetail> {
   }
   if (prices.length) price_min = Math.min(...prices);
 
-  return { start_time, price_min };
+  const text = decodeHtml(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, "\n")
+      .replace(/\n+/g, "\n")
+      .replace(/[ \t]+/g, " ")
+      .trim(),
+  );
+
+  const description = text ? text.slice(0, 1800) : null;
+  const lineup = [...new Set(
+    [...text.matchAll(/\b(?:artista|artistas|lineup|invitados?)\b\s*[:\-]\s*([^\n]+)/gi)]
+      .flatMap((match) => (match[1] ?? "").split(/\s*(?:,|\/|&|\+|\sy\s)\s*/i))
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && value.length <= 80),
+  )].slice(0, 6);
+
+  return { start_time, price_min, description, lineup };
 }
 
 // ─── Genre inference ─────────────────────────────────────────────────────────
@@ -457,52 +482,26 @@ async function upsertEvent(event: RawEvent): Promise<UpsertOutcome> {
     price_min:   normalizeScrapedPrice(event.price_min),
     price_max:   null,
     start_time:  event.start_time,
-    lineup:      [],
-    description: null,
+    lineup:      event.lineup,
+    description: event.description ?? null,
     is_active:   isMusicalEvent(event.name, event.venue ?? ""),
     source:      SOURCE,
   };
 
   try {
-    // Check existence first so we can distinguish insert vs update.
-    const { data: existing, error: selectError } = await supabase
-      .from("events")
-      .select("id, price_min, start_time, venue_id")
-      .eq("ticket_url", row.ticket_url)
-      .maybeSingle();
-
-    if (selectError) {
-      throw new Error(`SELECT failed for ${row.ticket_url}: ${selectError.message}`);
-    }
-
-    const isUpdate = existing !== null;
-
-    const writeRow: EventRow = existing
-      ? {
-          ...row,
-          price_min:  row.price_min  ?? existing.price_min,
-          start_time: row.start_time ?? existing.start_time,
-          venue_id:   row.venue_id   ?? existing.venue_id,
-        }
-      : row;
-
-    const { data: upserted, error: upsertError } = await supabase
-      .from("events")
-      .upsert(writeRow, { onConflict: "ticket_url" })
-      .select("id")
-      .single();
-
-    if (upsertError || !upserted) {
-      throw new Error(`UPSERT failed for ${row.ticket_url}: ${upsertError?.message}`);
-    }
+    const upserted = await upsertEventCanonical(supabase, {
+      ...row,
+      availability: "available",
+      availability_status: "available",
+    });
 
     // Link genres (non-fatal: errors are logged inside linkGenres)
     const slugs = inferGenresScraper(event);
     if (slugs.length) {
-      await linkGenres(upserted.id, slugs);
+      await linkGenres(upserted.eventId, slugs);
     }
 
-    return isUpdate ? "updated" : "inserted";
+    return upserted.operation;
   } catch (err) {
     console.error(`[sync-teleticket] upsertEvent error for ${event.ticket_url}:`, err);
     return "failed";
@@ -540,6 +539,8 @@ async function processPage(
     const detail = await fetchEventDetail(event.ticket_url);
     event.start_time = detail.start_time;
     event.price_min  = detail.price_min;
+    event.description = detail.description;
+    event.lineup = detail.lineup;
     await sleep(DETAIL_THROTTLE_MS);
 
     const outcome = await upsertEvent(event);

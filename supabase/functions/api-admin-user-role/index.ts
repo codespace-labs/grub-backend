@@ -1,5 +1,5 @@
 import { handleOptions, jsonResponse } from "../_shared/http.ts";
-import { requireAdmin, type AdminRole } from "../_shared/admin-auth.ts";
+import { requireAdmin, hasMinRole, type AdminRole } from "../_shared/admin-auth.ts";
 import { createServiceClient } from "../_shared/supabase.ts";
 
 interface UpdateRoleBody {
@@ -8,7 +8,7 @@ interface UpdateRoleBody {
 }
 
 function isAdminRole(value: string | undefined): value is AdminRole {
-  return value === "admin" || value === "operator" || value === "viewer";
+  return value === "superadmin" || value === "admin" || value === "operator" || value === "viewer";
 }
 
 Deno.serve(async (req: Request): Promise<Response> => {
@@ -20,6 +20,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   try {
+    // Minimum "admin" to change roles; "superadmin" required to assign superadmin role
     const actor = await requireAdmin(req, "admin");
     const body = (await req.json().catch(() => null)) as UpdateRoleBody | null;
     const userId = body?.user_id?.trim();
@@ -29,8 +30,19 @@ Deno.serve(async (req: Request): Promise<Response> => {
       return jsonResponse({ error: "Invalid payload" }, 400);
     }
 
+    // Only superadmin can grant or revoke superadmin role
+    if (nextRole === "superadmin" && actor.role !== "superadmin") {
+      return jsonResponse({ error: "Forbidden" }, 403);
+    }
+
+    // Admin cannot demote another admin unless they are superadmin
     const supabase = createServiceClient();
     const { data: userData, error: userError } = await supabase.auth.admin.getUserById(userId);
+
+    const targetCurrentRole = userData?.user?.app_metadata?.role ?? "viewer";
+    if (targetCurrentRole === "superadmin" && actor.role !== "superadmin") {
+      return jsonResponse({ error: "Forbidden" }, 403);
+    }
     if (userError || !userData.user) {
       throw userError ?? new Error("User not found");
     }

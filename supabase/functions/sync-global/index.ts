@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { classifyEventsBatch } from "../_shared/music-normalization-service.ts";
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
@@ -23,7 +24,9 @@ interface SyncResult {
   inserted?:   number;
   updated?:    number;
   failed?:     number;
+  skipped?:    number;
   error?:      string;
+  diagnostics?: Record<string, unknown>;
   durationMs:  number;
 }
 
@@ -33,26 +36,40 @@ interface OrchestratorResult {
   results:        SyncResult[];
   total_inserted: number;
   total_failed:   number;
+  normalization?: {
+    attempted: boolean;
+    error?: string;
+    batch?: Awaited<ReturnType<typeof classifyEventsBatch>>;
+  };
 }
 
 interface DispatchBody {
-  countries?: string[];
-  sources?:   string[];
-  syncRunId?: string;
+  countries?:     string[];
+  sources?:       string[];
+  syncRunId?:     string;
+  force_refresh?: boolean;
 }
+
+const DEFAULT_COUNTRIES = ["PE"] as const;
+const SOURCE_TIMEOUT_MS = 75_000;
 
 // ─── Source registry ──────────────────────────────────────────────────────────
 //
 // To add a new country: add an entry here.
-// To add a new scraper: create supabase/functions/sync-{type}/index.ts and
-// add a { type, countryCode, url } entry below — the orchestrator calls it
-// automatically with no other changes needed.
+// To add a new scraper:
+// 1. deploy `sync-{type}` from grub-workers to the same Supabase project
+// 2. add a { type, countryCode, url } entry below
+// The orchestrator lives in backend, but the scraper implementation belongs to
+// workers and is invoked over HTTP via the shared project.
 
 const SOURCES: Record<string, SourceConfig[]> = {
   PE: [
-    { type: "ticketmaster",    countryCode: "PE", market: "PE" },
     { type: "ticketmaster-pe", countryCode: "PE", url: "https://www.ticketmaster.pe/page/categoria-conciertos" },
     { type: "teleticket",      countryCode: "PE", url: "https://teleticket.com.pe/conciertos" },
+    { type: "joinnus",         countryCode: "PE", url: "https://www.joinnus.com/descubrir/concerts" },
+    { type: "passline",        countryCode: "PE" },
+    { type: "vastion",         countryCode: "PE", url: "https://www.vastiontickets.com/" },
+    { type: "tikpe",           countryCode: "PE", url: "https://tik.pe/events" },
   ],
   MX: [
     { type: "ticketmaster", countryCode: "MX", market: "MX" },
@@ -76,9 +93,11 @@ const SOURCES: Record<string, SourceConfig[]> = {
  * Passes countryCode + market + url in the POST body so each function
  * can use whatever fields it needs.
  */
-async function dispatch(cfg: SourceConfig): Promise<SyncResult> {
+async function dispatch(cfg: SourceConfig, forceRefresh = false): Promise<SyncResult> {
   const fnUrl   = `${SUPABASE_URL}/functions/v1/sync-${cfg.type}`;
   const startMs = Date.now();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(`timeout:${cfg.type}`), SOURCE_TIMEOUT_MS);
 
   console.log(`[sync-global] → ${cfg.type}/${cfg.countryCode} starting`);
 
@@ -90,13 +109,29 @@ async function dispatch(cfg: SourceConfig): Promise<SyncResult> {
         "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
         "Content-Type":  "application/json",
       },
+      signal: controller.signal,
       body: JSON.stringify({
-        countryCode: cfg.countryCode,
-        market:      cfg.market ?? cfg.countryCode,
-        url:         cfg.url,
+        countryCode:   cfg.countryCode,
+        market:        cfg.market ?? cfg.countryCode,
+        url:           cfg.url,
+        force_refresh: forceRefresh,
+        detailLimit:
+          cfg.type === "passline" ? 100
+          : cfg.type === "tikpe" ? 25
+          : undefined,
       }),
     });
   } catch (err) {
+    clearTimeout(timeoutId);
+    if (controller.signal.aborted) {
+      return {
+        source:     cfg.type,
+        country:    cfg.countryCode,
+        status:     "failed",
+        error:      `timeout after ${SOURCE_TIMEOUT_MS}ms`,
+        durationMs: Date.now() - startMs,
+      };
+    }
     const durationMs = Date.now() - startMs;
     console.error(`[sync-global] ✗ ${cfg.type}/${cfg.countryCode} network error:`, err);
     return {
@@ -106,6 +141,8 @@ async function dispatch(cfg: SourceConfig): Promise<SyncResult> {
       error:      err instanceof Error ? err.message : String(err),
       durationMs,
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   const durationMs = Date.now() - startMs;
@@ -122,20 +159,24 @@ async function dispatch(cfg: SourceConfig): Promise<SyncResult> {
     };
   }
 
-  const json = await raw.json().catch(() => ({})) as Record<string, number>;
+  const json = await raw.json().catch(() => ({})) as Record<string, unknown>;
 
   console.log(
     `[sync-global] ✓ ${cfg.type}/${cfg.countryCode} done in ${durationMs}ms —`,
-    `inserted=${json.inserted ?? 0} updated=${json.updated ?? 0} failed=${json.failed ?? 0}`,
+    `inserted=${Number(json.inserted ?? 0)} updated=${Number(json.updated ?? 0)} failed=${Number(json.failed ?? 0)} skipped=${Number(json.skipped ?? 0)}`,
   );
 
   return {
     source:     cfg.type,
     country:    cfg.countryCode,
     status:     "success",
-    inserted:   json.inserted  ?? 0,
-    updated:    json.updated   ?? 0,
-    failed:     json.failed    ?? 0,
+    inserted:   Number(json.inserted ?? 0),
+    updated:    Number(json.updated ?? 0),
+    failed:     Number(json.failed ?? 0),
+    skipped:    Number(json.skipped ?? 0),
+    diagnostics: typeof json.diagnostics === "object" && json.diagnostics !== null
+      ? json.diagnostics as Record<string, unknown>
+      : undefined,
     durationMs,
   };
 }
@@ -162,7 +203,7 @@ async function logSyncRunStart(body: DispatchBody): Promise<string | null> {
   return data.id as string;
 }
 
-async function logSyncRunResults(runId: string | null, results: SyncResult[], totals: { inserted: number; failed: number }) {
+async function logSyncRunResults(runId: string | null, results: SyncResult[], totals: { inserted: number; failed: number; skipped: number }) {
   if (!runId) return;
 
   const itemRows = results.map((result) => ({
@@ -173,10 +214,10 @@ async function logSyncRunResults(runId: string | null, results: SyncResult[], to
     inserted_count: result.inserted ?? 0,
     updated_count: result.updated ?? 0,
     failed_count: result.failed ?? 0,
-    skipped_count: 0,
+    skipped_count: result.skipped ?? 0,
     duration_ms: result.durationMs,
     error_message: result.error ?? null,
-    metadata: {},
+    metadata: result.diagnostics ?? {},
     started_at: new Date(Date.now() - result.durationMs).toISOString(),
     finished_at: new Date().toISOString(),
   }));
@@ -205,6 +246,7 @@ async function logSyncRunResults(runId: string | null, results: SyncResult[], to
       summary: {
         total_inserted: totals.inserted,
         total_failed: totals.failed,
+        total_skipped: totals.skipped,
         total_sources: results.length,
       },
     })
@@ -224,7 +266,7 @@ async function run(body: DispatchBody): Promise<OrchestratorResult> {
   // Resolve which countries to process
   const targetCountries = body.countries?.length
     ? body.countries.map((c) => c.toUpperCase())
-    : Object.keys(SOURCES);
+    : [...DEFAULT_COUNTRIES];
 
   // Resolve which source types to process (optional filter)
   const targetSources = body.sources?.map((s) => s.toLowerCase());
@@ -253,8 +295,9 @@ async function run(body: DispatchBody): Promise<OrchestratorResult> {
     byCountry.set(cfg.countryCode, list);
   }
 
+  const forceRefresh = body.force_refresh === true;
   const countryJobs = [...byCountry.values()].map((cfgs) =>
-    Promise.allSettled(cfgs.map(dispatch))
+    Promise.allSettled(cfgs.map((cfg) => dispatch(cfg, forceRefresh)))
   );
 
   const settled = await Promise.allSettled(countryJobs);
@@ -280,11 +323,52 @@ async function run(body: DispatchBody): Promise<OrchestratorResult> {
 
   const total_inserted = results.reduce((s, r) => s + (r.inserted ?? 0), 0);
   const total_failed   = results.filter((r) => r.status === "failed").length;
+  const total_skipped  = results.reduce((s, r) => s + (r.skipped ?? 0), 0);
 
   await logSyncRunResults(runId, results, {
     inserted: total_inserted,
     failed: total_failed,
+    skipped: total_skipped,
   });
+
+  let normalization: OrchestratorResult["normalization"] | undefined;
+  if (total_inserted > 0) {
+    try {
+      const batch = await classifyEventsBatch(supabase, {
+        limit: Math.min(Math.max(total_inserted * 2, 25), 100),
+        only_without_genres: true,
+        dry_run: false,
+      });
+      normalization = {
+        attempted: true,
+        batch,
+      };
+    } catch (error) {
+      console.error("[sync-global] normalization follow-up failed", error);
+      normalization = {
+        attempted: true,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  // ── Artist enrichment (fire-and-forget: no bloquea el resultado del sync) ──
+  // Se dispara solo cuando hay eventos nuevos. Procesa hasta 20 artistas
+  // pendientes en background para no alargar el timeout del cron.
+  if (total_inserted > 0) {
+    const enrichUrl = `${SUPABASE_URL}/functions/v1/enrich-artists`;
+    fetch(enrichUrl, {
+      method:  "POST",
+      headers: {
+        "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type":  "application/json",
+      },
+      body: JSON.stringify({ limit: 20 }),
+    }).catch((err) => {
+      console.warn("[sync-global] enrich-artists fire-and-forget failed:", err);
+    });
+    console.log("[sync-global] enrich-artists dispatched (limit=20, fire-and-forget)");
+  }
 
   return {
     started_at:  startedAt,
@@ -292,6 +376,7 @@ async function run(body: DispatchBody): Promise<OrchestratorResult> {
     results,
     total_inserted,
     total_failed,
+    normalization,
   };
 }
 
@@ -307,6 +392,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   try {
     const body: DispatchBody = await req.json().catch(() => ({}));
+
+    // ── Auth check ──────────────────────────────────────────────────────────────
+    const cronSecret = Deno.env.get("CRON_SECRET");
+    const auth = req.headers.get("Authorization") ?? "";
+    const allowedTokens = [
+      cronSecret ? `Bearer ${cronSecret}` : null,
+      SUPABASE_SERVICE_ROLE_KEY ? `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` : null,
+    ].filter((value): value is string => Boolean(value));
+
+    if (allowedTokens.length > 0 && !allowedTokens.includes(auth)) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     const result = await run(body);
     return new Response(JSON.stringify(result, null, 2), {
       status:  200,

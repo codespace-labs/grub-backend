@@ -285,6 +285,25 @@ Todas las tablas tienen lectura pública y escritura solo vía service_role (Edg
 
 Las Edge Functions corren en **Deno** en el runtime de Supabase. Se despliegan con el CLI de Supabase y se invocan via HTTP POST.
 
+### Nota de auth para `api-admin-*`
+
+Las Edge Functions del backoffice (`api-admin-*`) usan autorización interna con `requireAdmin()` desde `supabase/functions/_shared/admin-auth.ts`.
+
+Eso implica que:
+- la validación real de usuario y rol vive dentro de la function
+- el rol permitido se controla con `viewer`, `operator`, `admin` o `superadmin`
+- estas functions deben desplegarse con `--no-verify-jwt`
+
+Motivo:
+- si la gateway de Supabase Functions también intenta validar el JWT antes de ejecutar la function, aparece una doble auth
+- en ese escenario puede ocurrir un `401 Invalid JWT` en la gateway aunque el mismo token sí sea aceptado por `auth/v1/user`
+- el síntoma típico en backoffice es que `/api/auth/debug` devuelve `userCheck.status = 200` pero `adminEventsCheck.status = 401`
+
+Regla operativa:
+- `api-admin-*`: desplegar con `--no-verify-jwt`
+- functions públicas: decidir caso por caso según si dependen de auth interna o auth del gateway
+- workers/sync: normalmente también se despliegan con `--no-verify-jwt` porque suelen autenticarse con secrets internos, cron o service role
+
 ### `_shared/venue-upsert.ts`
 
 **Archivo:** `supabase/functions/_shared/venue-upsert.ts`
@@ -878,4 +897,83 @@ supabase functions deploy enrich-artists    --no-verify-jwt
 supabase functions deploy sync-global       --no-verify-jwt
 ```
 
+```bash
+supabase functions deploy api-admin-events             --no-verify-jwt --project-ref <project-ref>
+supabase functions deploy api-admin-normalization      --no-verify-jwt --project-ref <project-ref>
+supabase functions deploy api-admin-users              --no-verify-jwt --project-ref <project-ref>
+supabase functions deploy api-admin-event-deactivate   --no-verify-jwt --project-ref <project-ref>
+supabase functions deploy api-admin-quality-issues     --no-verify-jwt --project-ref <project-ref>
+supabase functions deploy api-admin-quality-issue-status --no-verify-jwt --project-ref <project-ref>
+supabase functions deploy api-admin-manual-overrides   --no-verify-jwt --project-ref <project-ref>
+supabase functions deploy api-admin-source-sync        --no-verify-jwt --project-ref <project-ref>
+```
+
 > `_shared/` no se despliega por separado — Supabase lo incluye automáticamente como parte de cada función que lo importa.
+
+---
+
+## 13. Decisión de arquitectura: Auth != Perfil
+
+Decisión acordada:
+
+- la identidad/autenticación del usuario no debe mezclarse con el dominio de perfil
+- `public.users` debe ser la base de identidad del usuario
+- el perfil y las features sociales deben vivir en tablas separadas
+
+Motivación:
+
+- auth cambia distinto que perfil
+- perfil/social crece más rápido y requiere otros índices, políticas y métricas
+- separar dominios evita sobrecargar `users` con campos de UI o producto
+- el backoffice puede administrar usuarios sin acoplarse a todo el dominio social
+
+Dirección propuesta para backend:
+
+- `public.users`
+  - identidad base
+  - source (`backoffice` / `customer`)
+  - provider (`google` / `apple` / `phone`)
+  - referencias externas (`clerk_user_id`, `supabase_user_id`)
+  - email, phone, display_name mínimo
+  - estado de verificación
+  - timestamps de creación / actualización / último acceso
+
+- `public.user_profiles`
+  - `user_id`
+  - `username`
+  - `bio`
+  - `avatar_url`
+  - `cover_url`
+  - otros campos de presentación del perfil
+
+- `public.user_stats`
+  - `user_id`
+  - `upcoming_count`
+  - `year_count`
+  - `total_count`
+  - contadores derivados y recalculables
+
+- `public.user_follows`
+  - `follower_user_id`
+  - `followed_user_id`
+  - timestamps
+
+- `public.user_event_activity`
+  - `user_id`
+  - `event_id`
+  - `status`
+  - `saved_at`
+  - `attended_at`
+  - u otras interacciones del usuario con eventos
+
+- `public.user_settings`
+  - `user_id`
+  - preferencias
+  - privacidad
+  - toggles de producto
+
+Alcance actual:
+
+- esto queda documentado como dirección oficial
+- todavía no está priorizado implementarlo completo
+- cuando se retome, debemos diseñar primero el modelo de datos y luego las APIs/admin views correspondientes

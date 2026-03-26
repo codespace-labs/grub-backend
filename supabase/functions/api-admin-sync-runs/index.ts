@@ -18,7 +18,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       .schema("ingestion")
       .from("sync_runs")
       .select("*")
-      .order("started_at", { ascending: false })
+      .order("created_at", { ascending: false })
       .limit(50);
 
     if (runsError) throw runsError;
@@ -30,13 +30,15 @@ Deno.serve(async (req: Request): Promise<Response> => {
           .from("sync_run_items")
           .select("*")
           .in("sync_run_id", runIds)
-          .order("started_at", { ascending: false })
+          .order("created_at", { ascending: false })
       : { data: [], error: null };
 
-    if (itemsError) throw itemsError;
+    if (itemsError) {
+      console.error("[api-admin-sync-runs] sync_run_items query failed", itemsError);
+    }
 
     const itemsByRunId = new Map<string, unknown[]>();
-    for (const item of items ?? []) {
+    for (const item of itemsError ? [] : (items ?? [])) {
       const bucket = itemsByRunId.get(item.sync_run_id) ?? [];
       bucket.push(item);
       itemsByRunId.set(item.sync_run_id, bucket);

@@ -1,0 +1,11 @@
+{
+  "tasks": {
+    "test": "deno test --allow-env --allow-net _tests/",
+    "test:unit": "deno test --allow-env _tests/unit/",
+    "test:integration": "deno test --allow-env --allow-net _tests/integration/"
+  },
+  "imports": {
+    "std/assert": "https://deno.land/std@0.208.0/assert/mod.ts",
+    "std/testing": "https://deno.land/std@0.208.0/testing/mock.ts"
+  }
+}
