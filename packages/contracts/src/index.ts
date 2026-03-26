@@ -4,8 +4,25 @@ export type GenreDto = {
   name: string;
 };
 
+export type ArtistDto = {
+  id: string;
+  name: string;
+  slug: string;
+  photo_url: string | null;
+  musicbrainz_id: string | null;
+  genres: GenreDto[];
+};
+
 export type EventGenreDto = {
   genres: GenreDto;
+};
+
+export type EventPresentationDto = {
+  vertical_title?: string | null;
+  horizontal_title?: string | null;
+  category_badge?: string | null;
+  vertical_image_fit?: "cover" | "contain" | null;
+  horizontal_image_fit?: "cover" | "contain" | null;
 };
 
 export type EventListItemDto = {
@@ -23,7 +40,10 @@ export type EventListItemDto = {
   source?: string | null;
   availability_status?: string | null;
   is_active?: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
   event_genres?: EventGenreDto[];
+  presentation?: EventPresentationDto;
 };
 
 export type HomeFeedResponse = {
@@ -58,6 +78,9 @@ export type SyncRunItemDto = {
   skipped_count: number;
   duration_ms: number;
   error_message: string | null;
+  metadata?: Record<string, unknown>;
+  started_at?: string;
+  finished_at?: string | null;
 };
 
 export type SyncRunDto = {
@@ -70,14 +93,23 @@ export type SyncRunDto = {
   items: SyncRunItemDto[];
 };
 
-export type AdminRole = "admin" | "operator" | "viewer";
+export type AdminRole = "superadmin" | "admin" | "operator" | "viewer";
 
 export type AdminUserDto = {
   id: string;
   email: string | null;
+  phone: string | null;
   role: AdminRole;
+  is_verified: boolean;
   created_at: string | null;
   last_sign_in_at: string | null;
+  source?: "backoffice" | "customer";
+  source_label?: string | null;
+  display_name?: string | null;
+  provider?: "google" | "apple" | "phone" | null;
+  avatar_url?: string | null;
+  clerk_user_id?: string | null;
+  editable?: boolean;
 };
 
 export type AuditLogDto = {

@@ -53,6 +53,73 @@ function hasVisibleVenue(event) {
   return !!venue && venue !== "-" && venue !== "por anunciar";
 }
 
+const EDITORIAL_BLOCK_PATTERNS = [
+  /\btributo\b/,
+  /\btribute\b/,
+  /\bhomenaje\b/,
+  /\brevive\b/,
+  /\bx siempre\b/,
+  /\bcumbia\b/,
+  /\bchicha\b/,
+  /\bhuayno?s?\b/,
+  /\bfolklor(?:e|ica|ico)\b/,
+  /\bfolkl[oó]ric[ao]s?\b/,
+  /\bandino?s?\b/,
+  /\bcriollo?s?\b/,
+  /\binfantil(?:es)?\b/,
+  /\bni(?:n|ñ)os?\b/,
+  /\bkids?\b/,
+  /\bteatro\b/,
+  /\bteatral\b/,
+  /\barlequin\b/,
+  /\bobra(?:\s+de)?\b/,
+  /\bmusical\b/,
+  /\bdramaturgia\b/,
+  /\bpuesta en escena\b/,
+  /\bcomedia\b/,
+  /\bhumor\b/,
+  /\bhumorist(?:a|ico|ica|icos|icas)\b/,
+  /\bimpro\b/,
+  /\bimprov\b/,
+  /\bimprovisaci[oó]n\b/,
+  /\bstand\s?-?up\b/,
+  /\bcomico\b/,
+  /\bc[oó]mico\b/,
+  /\bmon[oó]log(?:o|os)\b/,
+  /\bparodia\b/,
+  /\bsketch\b/,
+  /\bclown\b/,
+  /\bpayasos?\b/,
+  /\bballet\b/,
+  /\bdanza\b/,
+  /\bcoreograf(?:ia|ías|ias)\b/,
+  /\bflamenco\b/,
+  /\bcisnes\b/,
+  /\blago de los\b/,
+  /\bfiesta en la granja\b/,
+  /\bfamiliar\b/,
+  /\bfamily show\b/,
+  /\bpara toda la familia\b/,
+  /\bt[ií]teres\b/,
+  /\bmarionetas\b/,
+  /\bcuentacuentos\b/,
+  /\bcuento infantil\b/,
+  /\bmagia\b/,
+  /\bilusionismo\b/,
+  /\bacrobacia\b/,
+  /\bacrob[aá]tic[ao]s?\b/,
+  /\bcirco\b/,
+  /\br[ií]e por humor\b/,
+];
+
+const EDITORIAL_BLOCK_GENRES = new Set(["cumbia", "cumbia-andina", "folklore"]);
+
+function isEditoriallyBlocked(event) {
+  const name = normalizeText(event.name);
+  if (EDITORIAL_BLOCK_PATTERNS.some((pattern) => pattern.test(name))) return true;
+  return event.genres.some((slug) => EDITORIAL_BLOCK_GENRES.has(slug));
+}
+
 const GENRE_SIGNAL_RULES = [
   { slug: "techno", patterns: [/\btechno\b/] },
   { slug: "house", patterns: [/\bhouse\b/, /\btech house\b/, /\bdeep house\b/] },
@@ -116,7 +183,7 @@ async function fetchAllEvents() {
     const url = new URL(`${SUPABASE_URL}/rest/v1/events`);
     url.searchParams.set(
       "select",
-      "id,name,date,venue,city,country_code,source,ticket_url,event_genres(genres(slug))",
+      "id,name,date,venue,city,country_code,source,ticket_url,cover_url,event_genres(genres(slug))",
     );
     url.searchParams.set("order", "date.asc.nullslast");
     url.searchParams.set("limit", String(PAGE_SIZE));
@@ -164,18 +231,21 @@ async function main() {
   const genreIssues = events.filter((event) => getGenreQualityIssues(event).length > 0);
   const titleLocation = events.filter(hasLocationLeakInTitle);
   const noVenue = events.filter((event) => !hasVisibleVenue(event));
+  const editorialBlocked = events.filter(isEditoriallyBlocked);
 
   console.log(`[validate-event-quality] total=${events.length}`);
   console.log(`[validate-event-quality] missingGenre=${missingGenre.length}`);
   console.log(`[validate-event-quality] genreIssues=${genreIssues.length}`);
   console.log(`[validate-event-quality] titleLocation=${titleLocation.length}`);
   console.log(`[validate-event-quality] noVisibleVenue=${noVenue.length}`);
+  console.log(`[validate-event-quality] editorialBlocked=${editorialBlocked.length}`);
 
   printExamples("Eventos con género dudoso", genreIssues);
   printExamples("Eventos con ciudad pegada al título", titleLocation);
   printExamples("Eventos sin venue visible", noVenue);
+  printExamples("Eventos bloqueados editorialmente", editorialBlocked);
 
-  if (STRICT && (genreIssues.length || titleLocation.length)) {
+  if (STRICT && (genreIssues.length || titleLocation.length || editorialBlocked.length)) {
     process.exitCode = 1;
   }
 }

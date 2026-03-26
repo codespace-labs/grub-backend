@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { upsertEventCanonical } from "../_shared/event-write.ts";
 import { upsertVenue } from "../_shared/venue-upsert.ts";
 import {
   resolveEventLocation,
@@ -366,31 +367,32 @@ async function mapToRow(event: TmEvent, countryCode = "PE"): Promise<EventRow> {
 /**
  * For each inferred slug, resolves the genre_id from `genres` and inserts
  * into `event_genres`. Unknown slugs are silently skipped.
+ * Uses a single SELECT ... WHERE slug = ANY(...) to avoid N+1 queries.
  */
 async function linkGenres(eventId: string, slugs: string[]): Promise<void> {
-  for (const slug of slugs) {
-    const { data: genre } = await supabase
-      .from("genres")
-      .select("id")
-      .eq("slug", slug)
-      .maybeSingle();
+  if (!slugs.length) return;
 
-    if (!genre) {
-      console.warn(`[linkGenres] unknown slug "${slug}" — skipping`);
-      continue;
-    }
+  // Resuelve todos los genre_id en una sola query para evitar N+1
+  const { data: genres, error } = await supabase
+    .from("genres")
+    .select("id, slug")
+    .in("slug", slugs);
 
-    const { error } = await supabase
-      .from("event_genres")
-      .insert({ event_id: eventId, genre_id: genre.id })
-      .select()
-      // ON CONFLICT DO NOTHING equivalent via ignoreDuplicates
-      ;
+  if (error) {
+    console.error("[linkGenres] no se pudo consultar géneros:", error.message);
+    return;
+  }
 
-    // Postgres unique-violation code: 23505 — treat as harmless
-    if (error && error.code !== "23505") {
-      console.error(`[linkGenres] insert failed for slug "${slug}":`, error.message);
-    }
+  if (!genres?.length) return;
+
+  const rows = genres.map((g) => ({ event_id: eventId, genre_id: g.id }));
+
+  const { error: insertErr } = await supabase
+    .from("event_genres")
+    .upsert(rows, { onConflict: "event_id,genre_id", ignoreDuplicates: true });
+
+  if (insertErr) {
+    console.error("[linkGenres] insert error:", insertErr.message);
   }
 }
 
@@ -404,72 +406,29 @@ async function upsertEvent(event: TmEvent, countryCode = "PE"): Promise<UpsertOu
 
   const row = await mapToRow(event, countryCode);
 
-  // 1. Buscar por external_slug primero (detecta dups entre API y scraper web)
-  let existing: {
-    id: string;
-    price_min: number | null;
-    price_max: number | null;
-    venue_id: string | null;
-  } | null = null;
-
-  if (row.external_slug) {
-    const { data } = await supabase
-        .from("events")
-        .select("id, price_min, price_max, venue_id")
-        .eq("external_slug", row.external_slug)
-        .maybeSingle();
-    existing = data;
-  }
-
-  // 2. Fallback: buscar por ticket_url
-  if (!existing) {
-      const { data, error: selectError } = await supabase
-        .from("events")
-        .select("id, price_min, price_max, venue_id")
-        .eq("ticket_url", row.ticket_url)
-        .maybeSingle();
-    if (selectError) throw new Error(`SELECT failed for ${row.ticket_url}: ${selectError.message}`);
-    existing = data;
-  }
-
-  const isUpdate = existing !== null;
-  const writeRow = existing
-    ? {
-        ...row,
-        price_min: row.price_min ?? existing.price_min,
-        price_max: row.price_max ?? existing.price_max,
-        venue_id: row.venue_id ?? existing.venue_id,
-      }
-    : row;
-
-  const query = supabase.from("events");
-  const { data: upserted, error: upsertError } = existing
-    ? await query
-        .update(writeRow)
-        .eq("id", existing.id)
-        .select("id")
-        .single()
-    : await query
-        .upsert(writeRow, { onConflict: "ticket_url" })
-        .select("id")
-        .single();
-
-  if (upsertError || !upserted) {
-    throw new Error(`UPSERT failed for ${row.ticket_url}: ${upsertError?.message}`);
-  }
+  const upserted = await upsertEventCanonical(supabase, {
+    ...row,
+    availability: "available",
+    availability_status: "available",
+  });
 
   const slugs = inferGenres(event);
   if (slugs.length) {
-    await linkGenres(upserted.id, slugs);
+    await linkGenres(upserted.eventId, slugs);
   }
 
-  return isUpdate ? "updated" : "inserted";
+  return upserted.operation;
 }
 
 // ─── Main loop ────────────────────────────────────────────────────────────────
 
 async function run(market = "PE", countryCode = "PE"): Promise<SyncResult> {
   const result: SyncResult = { inserted: 0, updated: 0, failed: 0 };
+
+  if (countryCode.toUpperCase() === "PE") {
+    console.log("[sync-ticketmaster] PE disabled: using sync-ticketmaster-pe (Firecrawl) as the only Ticketmaster integration");
+    return result;
+  }
 
   console.log(`[sync-ticketmaster] version=${SCRAPER_VERSION} market=${market} country=${countryCode}`);
 

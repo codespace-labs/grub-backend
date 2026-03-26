@@ -1,5 +1,6 @@
 import { handleOptions, jsonResponse } from "../_shared/http.ts";
 import { createServiceClient } from "../_shared/supabase.ts";
+import { isEventVisibleInApp } from "../_shared/event-visibility.ts";
 
 Deno.serve(async (req: Request): Promise<Response> => {
   const options = handleOptions(req);
@@ -15,6 +16,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
     if (!eventId) return jsonResponse({ error: "Missing id" }, 400);
 
     const supabase = createServiceClient();
+    const isVisible = await isEventVisibleInApp(supabase, eventId);
+    if (!isVisible) return jsonResponse({ error: "Not found" }, 404);
+
     const { data, error } = await supabase
       .from("events")
       .select(`
@@ -31,7 +35,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
         )
       `)
       .eq("id", eventId)
-      .eq("is_active", true)
       .maybeSingle();
 
     if (error) throw error;
