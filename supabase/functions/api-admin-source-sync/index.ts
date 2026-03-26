@@ -13,11 +13,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
   try {
     const { user, role } = await requireAdmin(req, "operator");
     const body = await req.json().catch(() => ({}));
-    const source = body.source;
+    const source = typeof body.source === "string" && body.source.trim().length > 0
+      ? body.source.trim()
+      : null;
     const countries = body.countries ?? ["PE"];
     const forceRefresh = body.force_refresh === true;
-
-    if (!source) return jsonResponse({ error: "Missing source" }, 400);
 
     const supabase = createServiceClient();
     const { data: run, error: runError } = await supabase
@@ -27,9 +27,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
         trigger_source: "admin_api",
         status: "running",
         country_codes: countries,
-        source_filters: [source],
+        source_filters: source ? [source] : null,
         triggered_by: user.id,
-        summary: { requested_source: source },
+        summary: { requested_source: source ?? "global" },
       })
       .select("id")
       .single();
@@ -48,7 +48,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        sources: [source],
+        sources: source ? [source] : undefined,
         countries,
         syncRunId: runId ?? undefined,
         force_refresh: forceRefresh,
@@ -64,7 +64,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         .update({
           status: "failed",
           finished_at: new Date().toISOString(),
-          summary: { requested_source: source, response: payload, wrapper_error: true },
+          summary: { requested_source: source ?? "global", response: payload, wrapper_error: true },
         })
         .eq("id", runId);
 
@@ -79,7 +79,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       action: "source.sync",
       entity_type: "sync_run",
       entity_id: runId,
-      payload: { source, countries, response: payload },
+      payload: { source: source ?? "global", countries, response: payload },
     });
 
     if (auditError) {
