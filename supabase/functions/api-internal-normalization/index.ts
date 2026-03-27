@@ -2,6 +2,12 @@ import { handleOptions, jsonResponse } from "../_shared/http.ts";
 import { createServiceClient } from "../_shared/supabase.ts";
 import { requireInternalAccess } from "../_shared/internal-auth.ts";
 import {
+  enrichEventsWithAiBatch,
+  validateEventsWithAiBatch,
+  type EnrichmentBatchInput,
+  type JudgeBatchInput,
+} from "../_shared/ai-event-enrichment.ts";
+import {
   classifyEventsBatch,
   classifyEventFromLineup,
   getNormalizationOverview,
@@ -59,10 +65,20 @@ Deno.serve(async (req) => {
     }
 
     const body = await parseJsonBody<{
-      action?: "normalize" | "batch" | "revalidate" | "classify_event" | "classify_events_batch" | "overview";
+      action?:
+        | "normalize"
+        | "batch"
+        | "revalidate"
+        | "classify_event"
+        | "classify_events_batch"
+        | "ai_enrich_events_batch"
+        | "ai_judge_events_batch"
+        | "overview";
       input?: NormalizationInput;
       items?: NormalizationInput[];
       options?: ClassifyEventsBatchInput;
+      ai_options?: EnrichmentBatchInput;
+      judge_options?: JudgeBatchInput;
     }>(req);
 
     const action = body.action ?? "normalize";
@@ -86,6 +102,16 @@ Deno.serve(async (req) => {
 
     if (action === "classify_events_batch") {
       const result = await classifyEventsBatch(supabase, body.options ?? {});
+      return jsonResponse(result);
+    }
+
+    if (action === "ai_enrich_events_batch") {
+      const result = await enrichEventsWithAiBatch(supabase, body.ai_options ?? {});
+      return jsonResponse(result);
+    }
+
+    if (action === "ai_judge_events_batch") {
+      const result = await validateEventsWithAiBatch(supabase, body.judge_options ?? {});
       return jsonResponse(result);
     }
 

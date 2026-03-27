@@ -101,12 +101,15 @@ export async function upsertEventCanonical(
     start_time: string | null;
     venue_id: string | null;
     is_active: boolean;
+    pipeline_excluded: boolean;
+    pipeline_excluded_reason: string | null;
+    pipeline_excluded_at: string | null;
   } | null = null;
 
   if (existingEventId) {
     const { data, error } = await supabase
       .from("events")
-      .select("id, price_min, price_max, start_time, venue_id, is_active")
+      .select("id, price_min, price_max, start_time, venue_id, is_active, pipeline_excluded, pipeline_excluded_reason, pipeline_excluded_at")
       .eq("id", existingEventId)
       .single();
 
@@ -127,6 +130,9 @@ export async function upsertEventCanonical(
         start_time: row.start_time ?? existing.start_time,
         venue_id: row.venue_id ?? existing.venue_id,
         is_active: existing.is_active,
+        pipeline_excluded: existing.pipeline_excluded,
+        pipeline_excluded_reason: existing.pipeline_excluded_reason,
+        pipeline_excluded_at: existing.pipeline_excluded_at,
       }
     : {
         ...row,

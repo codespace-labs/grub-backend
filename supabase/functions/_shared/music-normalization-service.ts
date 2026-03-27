@@ -95,6 +95,7 @@ export interface ClassifyEventsBatchInput {
   dry_run?: boolean;
   force_refresh?: boolean;
   exclude_event_ids?: string[];
+  active_status?: "active" | "inactive" | "all";
 }
 
 export interface ClassifyEventsBatchResult {
@@ -115,6 +116,7 @@ export interface ClassifyEventsBatchResult {
     confidence?: number;
     review_required?: boolean;
     review_reason_code?: string;
+    auto_hidden?: boolean;
     unmapped_signals?: string[];
     discarded_tags?: string[];
     source_providers?: string[];
@@ -145,6 +147,8 @@ interface EventRowForClassification {
   country_code: string | null;
   venue: string | null;
   date: string | null;
+  is_active?: boolean | null;
+  pipeline_excluded?: boolean | null;
   event_genres?: Array<{ genre_id?: string | number | null }> | null;
 }
 
@@ -1436,6 +1440,20 @@ async function createMissingArtistResult(
   };
 }
 
+async function hideEventForLowConfidence(
+  supabase: SupabaseClient,
+  eventId: string,
+): Promise<void> {
+  const { error } = await supabase
+    .from("events")
+    .update({ is_active: false })
+    .eq("id", eventId);
+
+  if (error) {
+    throw new Error(`EVENT_AUTO_HIDE failed for ${eventId}: ${error.message}`);
+  }
+}
+
 export async function classifyEventFromLineup(
   supabase: SupabaseClient,
   input: NormalizationInput,
@@ -1476,39 +1494,8 @@ async function selectEventsForBatch(
   options: ClassifyEventsBatchInput,
 ): Promise<EventRowForClassification[]> {
   const requestedLimit = Math.min(Math.max(options.limit ?? 25, 1), 100);
-  const fetchLimit = Math.min(Math.max(requestedLimit * 4, 60), 400);
-
-  let query = supabase
-    .from("events")
-    .select(`
-      id,
-      name,
-      description,
-      lineup,
-      event_artists (
-        order_index,
-        artists ( name )
-      ),
-      source,
-      ticket_url,
-      city,
-      country_code,
-      venue,
-      date,
-      is_active,
-      event_genres ( genre_id )
-    `)
-    .eq("is_active", true)
-    .order("date", { ascending: true })
-    .limit(fetchLimit);
-
-  if (options.source) query = query.eq("source", options.source);
-  if (options.date_from) query = query.gte("date", options.date_from);
-
-  const { data, error } = await query;
-  if (error) throw error;
-
-  const rows = (data ?? []) as unknown as EventRowForClassification[];
+  const pageSize = 250;
+  const maxScan = 5000;
   const recentAttemptedEventIds = new Set<string>();
   const excludedEventIds = new Set(
     Array.isArray(options.exclude_event_ids)
@@ -1538,6 +1525,50 @@ async function selectEventsForBatch(
       if (!eventId) continue;
       recentAttemptedEventIds.add(eventId);
     }
+  }
+
+  const rows: EventRowForClassification[] = [];
+  for (let offset = 0; offset < maxScan; offset += pageSize) {
+    let query = supabase
+      .from("events")
+      .select(`
+        id,
+        name,
+        description,
+        lineup,
+        event_artists (
+          order_index,
+          artists ( name )
+        ),
+        source,
+        ticket_url,
+        city,
+        country_code,
+        venue,
+        date,
+        is_active,
+        pipeline_excluded,
+        event_genres ( genre_id )
+      `)
+      .order("date", { ascending: true })
+      .range(offset, offset + pageSize - 1);
+
+    if (options.active_status === "inactive") query = query.eq("is_active", false);
+    else if (options.active_status === "all") query = query;
+    else query = query.eq("is_active", true);
+    query = query.eq("pipeline_excluded", false);
+
+    if (options.source) query = query.eq("source", options.source);
+    if (options.date_from) query = query.gte("date", options.date_from);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const pageRows = (data ?? []) as unknown as EventRowForClassification[];
+    if (pageRows.length === 0) break;
+    rows.push(...pageRows);
+
+    if (pageRows.length < pageSize) break;
   }
 
   function scoreEvent(row: EventRowForClassification): number {
@@ -1587,6 +1618,7 @@ async function selectEventsForBatch(
 
   const filtered = rows.filter((row) => {
     if (excludedEventIds.has(row.id)) return false;
+    if (row.pipeline_excluded === true) return false;
     if (isClearlyNonMusicalEvent(row)) return false;
     if (options.only_without_genres === false) return true;
     const withoutGenres = !Array.isArray(row.event_genres) || row.event_genres.length === 0;
@@ -1660,6 +1692,11 @@ export async function classifyEventsBatch(
                 : result.review_required
                   ? "manual_review"
                   : undefined;
+      const shouldAutoHide = eventStatus === "ambiguous" || eventStatus === "skipped_no_artist";
+
+      if (!dryRun && shouldAutoHide) {
+        await hideEventForLowConfidence(supabase, event.id);
+      }
 
       return {
         event_id: event.id,
@@ -1676,6 +1713,7 @@ export async function classifyEventsBatch(
         confidence: result.confidence,
         review_required: result.review_required,
         review_reason_code: isClearlyNonMusicalEvent(event) ? "editorial_non_music" : reviewReasonCode,
+        auto_hidden: shouldAutoHide && !dryRun,
         unmapped_signals: result.unmapped_signals,
         discarded_tags: result.discarded_tags,
         source_providers: dedupe(result.sources.map((source) => source.provider)),
@@ -1734,25 +1772,72 @@ function startOfLimaDayUtcIso(): string {
 export async function getNormalizationOverview(
   supabase: SupabaseClient,
 ): Promise<NormalizationOverview> {
-  const { count: openReviewCount } = await supabase
-    .schema("normalization")
-    .from("review_queue")
-    .select("id", { count: "exact", head: true })
-    .eq("status", "open");
+  const openReviewRows: Array<{
+    reason_code: string | null;
+    payload?: Record<string, unknown> | null;
+  }> = [];
 
-  const { count: openMissingArtistCount } = await supabase
-    .schema("normalization")
-    .from("review_queue")
-    .select("id", { count: "exact", head: true })
-    .eq("status", "open")
-    .eq("reason_code", "missing_artist");
+  for (let offset = 0; offset < 5000; offset += 1000) {
+    const { data, error } = await supabase
+      .schema("normalization")
+      .from("review_queue")
+      .select("reason_code, payload")
+      .eq("status", "open")
+      .range(offset, offset + 999);
 
-  const { count: openUnresolvedArtistCount } = await supabase
-    .schema("normalization")
-    .from("review_queue")
-    .select("id", { count: "exact", head: true })
-    .eq("status", "open")
-    .in("reason_code", ["missing_artist", "unresolved_artist"]);
+    if (error || !data?.length) break;
+    openReviewRows.push(...data as Array<{ reason_code: string | null; payload?: Record<string, unknown> | null }>);
+    if (data.length < 1000) break;
+  }
+
+  const allEventIds = new Set<string>();
+  const missingArtistEventIds = new Set<string>();
+  const unresolvedArtistEventIds = new Set<string>();
+
+  for (const row of openReviewRows) {
+    const payload = row.payload ?? {};
+    const input = payload.input && typeof payload.input === "object"
+      ? payload.input as Record<string, unknown>
+      : null;
+    const eventId = typeof input?.event_id === "string" && input.event_id.trim().length > 0
+      ? input.event_id.trim()
+      : null;
+
+    if (!eventId) continue;
+    allEventIds.add(eventId);
+
+    if (row.reason_code === "missing_artist") {
+      missingArtistEventIds.add(eventId);
+      unresolvedArtistEventIds.add(eventId);
+      continue;
+    }
+
+    if (row.reason_code === "unresolved_artist") {
+      unresolvedArtistEventIds.add(eventId);
+    }
+  }
+
+  const eventIds = [...allEventIds];
+  const activeEventIds = new Set<string>();
+
+  if (eventIds.length > 0) {
+    for (let offset = 0; offset < eventIds.length; offset += 500) {
+      const chunk = eventIds.slice(offset, offset + 500);
+      const { data } = await supabase
+        .from("events")
+        .select("id")
+        .in("id", chunk)
+        .eq("is_active", true);
+
+      for (const row of (data ?? []) as Array<{ id: string }>) {
+        activeEventIds.add(row.id);
+      }
+    }
+  }
+
+  const openReviewCount = [...allEventIds].filter((id) => activeEventIds.has(id)).length;
+  const openMissingArtistCount = [...missingArtistEventIds].filter((id) => activeEventIds.has(id)).length;
+  const openUnresolvedArtistCount = [...unresolvedArtistEventIds].filter((id) => activeEventIds.has(id)).length;
 
   const { count: classifiedTodayCount } = await supabase
     .schema("normalization")
@@ -1794,9 +1879,9 @@ export async function getNormalizationOverview(
 
   return {
     classified_today_count: classifiedTodayCount ?? 0,
-    open_review_count: openReviewCount ?? 0,
-    open_missing_artist_count: openMissingArtistCount ?? 0,
-    open_unresolved_artist_count: openUnresolvedArtistCount ?? 0,
+    open_review_count: openReviewCount,
+    open_missing_artist_count: openMissingArtistCount,
+    open_unresolved_artist_count: openUnresolvedArtistCount,
     top_unmapped_signals: topUnmappedSignals,
   };
 }

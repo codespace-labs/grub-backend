@@ -46,6 +46,11 @@ async function jsonFetch<T>(
   return (await response.json()) as T;
 }
 
+function isRecoverableSpotifyError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /Upstream (401|403|429)\b/.test(error.message);
+}
+
 export async function searchMusicBrainzArtist(
   artistName: string,
 ): Promise<MusicBrainzCandidate[]> {
@@ -167,13 +172,26 @@ export async function searchSpotifyArtist(
   url.searchParams.set("type", "artist");
   url.searchParams.set("limit", "3");
 
-  const data = await jsonFetch<{
+  let data: {
     artists?: { items?: Array<Record<string, unknown>> };
-  }>(url.toString(), {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
+  };
+
+  try {
+    data = await jsonFetch<{
+      artists?: { items?: Array<Record<string, unknown>> };
+    }>(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+  } catch (error) {
+    if (isRecoverableSpotifyError(error)) {
+      spotifyTokenCache = null;
+      console.warn("[music-provider-clients] spotify fallback disabled for this request", error);
+      return [];
+    }
+    throw error;
+  }
 
   return (data.artists?.items ?? []).map((artist) => ({
     id: String(artist.id ?? ""),

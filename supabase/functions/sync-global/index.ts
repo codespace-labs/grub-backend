@@ -51,7 +51,15 @@ interface DispatchBody {
 }
 
 const DEFAULT_COUNTRIES = ["PE"] as const;
-const SOURCE_TIMEOUT_MS = 75_000;
+const DEFAULT_SOURCE_TIMEOUT_MS = 75_000;
+const SOURCE_TIMEOUT_MS_BY_TYPE: Record<string, number> = {
+  teleticket: 180_000,
+  "ticketmaster-pe": 120_000,
+  passline: 120_000,
+  joinnus: 120_000,
+  vastion: 120_000,
+  tikpe: 120_000,
+};
 
 // ─── Source registry ──────────────────────────────────────────────────────────
 //
@@ -96,8 +104,9 @@ const SOURCES: Record<string, SourceConfig[]> = {
 async function dispatch(cfg: SourceConfig, forceRefresh = false): Promise<SyncResult> {
   const fnUrl   = `${SUPABASE_URL}/functions/v1/sync-${cfg.type}`;
   const startMs = Date.now();
+  const timeoutMs = SOURCE_TIMEOUT_MS_BY_TYPE[cfg.type] ?? DEFAULT_SOURCE_TIMEOUT_MS;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(`timeout:${cfg.type}`), SOURCE_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(`timeout:${cfg.type}`), timeoutMs);
 
   console.log(`[sync-global] → ${cfg.type}/${cfg.countryCode} starting`);
 
@@ -128,7 +137,7 @@ async function dispatch(cfg: SourceConfig, forceRefresh = false): Promise<SyncRe
         source:     cfg.type,
         country:    cfg.countryCode,
         status:     "failed",
-        error:      `timeout after ${SOURCE_TIMEOUT_MS}ms`,
+        error:      `timeout after ${timeoutMs}ms`,
         durationMs: Date.now() - startMs,
       };
     }
